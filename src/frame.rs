@@ -55,7 +55,9 @@ impl Decoder for UFProto {
                             }
                         }
                     } else {
-                        Ok(None)
+                        // It seems Ok(None) is not an option for datagram stream decoder
+                        // server hangs up
+                        Ok(Some(InMsg::Corrupted{ error: failure::err_msg("Incorrect file name length") }))
                     }
                 }
                 REQ => {
