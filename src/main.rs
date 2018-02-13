@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(windows)]
 use std::os::windows::prelude::*;
 #[cfg(unix)]
@@ -35,8 +36,10 @@ type Result<T> = ::std::result::Result<T, Error>;
 type Jobs = Rc<RefCell<HashMap<(u64, SocketAddr), Job>>>;
 
 const MAX_CONNECTIONS: usize = 100;
-const CHUNK_SIZE: u16 = 1400;
+const CHUNK_SIZE: u16 = 1420 * 4;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_OUTBOUND_QUEUE_LEN: usize = 10_000;
+static OUTBOUND_QUEUE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 fn main() {
     rmain().unwrap();
@@ -48,7 +51,7 @@ fn rmain() -> Result<()> {
     let timer = Timer::default();
     let ssock = UdpSocket::bind(&SocketAddr::new("0.0.0.0".parse()?, 4432))?;
     let (send, recv) = UdpFramed::new(ssock, UFProto).split();
-    let (isend, irecv) = mpsc::channel(1024 * 1024);
+    let (isend, irecv) = mpsc::channel(1024);
     let irecv = irecv.map_err(|_| frame::MsgFormatError);
 
     let job_pool = job_pool_0.clone();
@@ -68,14 +71,17 @@ fn rmain() -> Result<()> {
                 );
             }
             InMsg::Req { connid, start } => {
-                process_req(
-                    &cpu_pool,
-                    addr.clone(),
-                    isend.clone(),
-                    job_pool.clone(),
-                    connid,
-                    start,
-                );
+                // Limit the queue of outbound packets
+                if OUTBOUND_QUEUE_LEN.load(Ordering::Relaxed) < MAX_OUTBOUND_QUEUE_LEN {
+                    process_req(
+                        &cpu_pool,
+                        addr.clone(),
+                        isend.clone(),
+                        job_pool.clone(),
+                        connid,
+                        start,
+                    );
+                }
             }
             InMsg::End { connid } => {
                 job_pool.borrow_mut().remove(&(connid, addr.clone()));
@@ -89,7 +95,10 @@ fn rmain() -> Result<()> {
 
     // send is not cloneable
     // channel data thru isend
-    let sender = send.send_all(irecv)
+    let sender = send.with(|v| -> Result<_> {
+        OUTBOUND_QUEUE_LEN.fetch_sub(1, Ordering::SeqCst);
+        Ok(v)
+    }).send_all(irecv)
         .map_err(|e| panic!("Sender task terminated unexpectedly. {}", e))
         .then(|_| Ok(()));
 
@@ -101,7 +110,11 @@ fn rmain() -> Result<()> {
             let now = Instant::now();
             // Clean up timed out connections
             job_pool.retain(|_, v| now - v.last_active < CLIENT_TIMEOUT);
-            println!("I'm alive. Active transfers: {}", job_pool.len());
+            println!(
+                "I'm alive. Active transfers: {}. Outbound queue: {}",
+                job_pool.len(),
+                OUTBOUND_QUEUE_LEN.load(Ordering::Relaxed)
+            );
             Ok(())
         })
         .map_err(|e| panic!("Timer task terminated unexpectedly. {}", e));
@@ -119,10 +132,8 @@ fn task_send(
     addr: &SocketAddr,
     msg: OutMsg,
 ) -> impl Future<Item = (), Error = ()> {
-    isend
-        .clone()
-        .send((msg, addr.clone()))
-        .then(|_| Ok(()))
+    OUTBOUND_QUEUE_LEN.fetch_add(1, Ordering::SeqCst);
+    isend.clone().send((msg, addr.clone())).then(|_| Ok(()))
 }
 
 fn task_end(
@@ -130,10 +141,7 @@ fn task_end(
     addr: &SocketAddr,
     connid: u64,
 ) -> impl Future<Item = (), Error = ()> {
-    isend
-        .clone()
-        .send((OutMsg::End { connid }, addr.clone()))
-        .then(|_| Ok(()))
+    task_send(isend, addr, OutMsg::End { connid })
 }
 
 fn process_hello(
