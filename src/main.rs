@@ -96,7 +96,7 @@ fn rmain() -> Result<()> {
     // send is not cloneable
     // channel data thru isend
     let sender = send.with(|v| -> Result<_> {
-        OUTBOUND_QUEUE_LEN.fetch_sub(1, Ordering::SeqCst);
+        OUTBOUND_QUEUE_LEN.fetch_sub(1, Ordering::Relaxed);
         Ok(v)
     }).send_all(irecv)
         .map_err(|e| panic!("Sender task terminated unexpectedly. {}", e))
@@ -132,7 +132,7 @@ fn task_send(
     addr: &SocketAddr,
     msg: OutMsg,
 ) -> impl Future<Item = (), Error = ()> {
-    OUTBOUND_QUEUE_LEN.fetch_add(1, Ordering::SeqCst);
+    OUTBOUND_QUEUE_LEN.fetch_add(1, Ordering::Relaxed);
     isend.clone().send((msg, addr.clone())).then(|_| Ok(()))
 }
 
