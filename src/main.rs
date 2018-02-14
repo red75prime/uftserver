@@ -12,7 +12,7 @@ extern crate tokio_timer;
 mod frame;
 
 use failure::Error;
-use futures::{future, Future, Sink, Stream};
+use futures::{Future, Sink, Stream};
 use futures::sync::mpsc::{self, Sender};
 use futures_cpupool::CpuPool;
 use frame::{InMsg, OutMsg, UFProto};
@@ -64,7 +64,7 @@ fn rmain() -> Result<()> {
             InMsg::Hello { file_name } => {
                 process_hello(
                     &cpu_pool,
-                    addr.clone(),
+                    addr,
                     isend.clone(),
                     job_pool.clone(),
                     &file_name,
@@ -75,7 +75,7 @@ fn rmain() -> Result<()> {
                 if OUTBOUND_QUEUE_LEN.load(Ordering::Relaxed) < MAX_OUTBOUND_QUEUE_LEN {
                     process_req(
                         &cpu_pool,
-                        addr.clone(),
+                        addr,
                         isend.clone(),
                         job_pool.clone(),
                         connid,
@@ -84,13 +84,15 @@ fn rmain() -> Result<()> {
                 }
             }
             InMsg::End { connid } => {
-                job_pool.borrow_mut().remove(&(connid, addr.clone()));
-                current_thread::spawn(task_send(&isend, &addr, OutMsg::End { connid }));
+                job_pool.borrow_mut().remove(&(connid, addr));
+                current_thread::spawn(task_send(&isend, addr, OutMsg::End { connid }));
             }
         }
         Ok(())
     }).map_err(|e| {
         panic!("Server loop terminated unexpectedly. {}", e);
+    }).map(|_| {
+        panic!("Server loop terminated unexpectedly with no error");
     });
 
     // send is not cloneable
@@ -100,7 +102,7 @@ fn rmain() -> Result<()> {
         Ok(v)
     }).send_all(irecv)
         .map_err(|e| panic!("Sender task terminated unexpectedly. {}", e))
-        .then(|_| Ok(()));
+        .map(|_| panic!("Sender task terminated unexpectedly with no error."));
 
     let job_pool = job_pool_0.clone();
     let timer_task = timer
@@ -117,7 +119,8 @@ fn rmain() -> Result<()> {
             );
             Ok(())
         })
-        .map_err(|e| panic!("Timer task terminated unexpectedly. {}", e));
+        .map_err(|e| panic!("Timer task terminated unexpectedly. {}", e))
+        .map(|_| panic!("Timer task terminated unexpectedly with no error."));
 
     current_thread::run(|_| {
         current_thread::spawn(server);
@@ -129,16 +132,16 @@ fn rmain() -> Result<()> {
 
 fn task_send(
     isend: &Sender<(OutMsg, SocketAddr)>,
-    addr: &SocketAddr,
+    addr: SocketAddr,
     msg: OutMsg,
 ) -> impl Future<Item = (), Error = ()> {
     OUTBOUND_QUEUE_LEN.fetch_add(1, Ordering::Relaxed);
-    isend.clone().send((msg, addr.clone())).then(|_| Ok(()))
+    isend.clone().send((msg, addr)).then(|_| Ok(()))
 }
 
 fn task_end(
     isend: &Sender<(OutMsg, SocketAddr)>,
-    addr: &SocketAddr,
+    addr: SocketAddr,
     connid: u64,
 ) -> impl Future<Item = (), Error = ()> {
     task_send(isend, addr, OutMsg::End { connid })
@@ -152,13 +155,13 @@ fn process_hello(
     file_name: &str,
 ) {
     if jobs.borrow().len() >= MAX_CONNECTIONS {
-        current_thread::spawn(task_end(&isend, &addr, 0));
+        current_thread::spawn(task_end(&isend, addr, 0));
         return;
     }
     let path = PathBuf::from(file_name);
     // open file asynchronously, then send answer to the client
     let hello = cpu_pool
-        .spawn_fn(move || future::ok(get_file(&path)))
+        .spawn_fn(move || Ok(get_file(&path)))
         .and_then(move |res| {
             if let Some((file, file_len)) = res {
                 let connid;
@@ -174,10 +177,10 @@ fn process_hello(
                     last_active: Instant::now(),
                     file_len,
                 };
-                jobs.borrow_mut().insert((connid, addr.clone()), job);
+                jobs.borrow_mut().insert((connid, addr), job);
                 let send_task = task_send(
                     &isend,
-                    &addr,
+                    addr,
                     OutMsg::Hello {
                         connid,
                         file_len,
@@ -201,7 +204,7 @@ fn process_req(
 ) {
     let file;
     let file_len;
-    if let Some(job) = jobs.borrow_mut().get_mut(&(connid, addr.clone())) {
+    if let Some(job) = jobs.borrow_mut().get_mut(&(connid, addr)) {
         file_len = job.file_len;
         // Tokio has no cross platform async file operations
         // File reading on file's clone will be performed in cpu_pool
@@ -231,16 +234,16 @@ fn process_req(
     // Read chunk in cpu_pool, then send data
     let read_and_send = cpu_pool
         .spawn_fn(move || {
-            let buffer_len = u64::min(CHUNK_SIZE as u64, file_len - start) as usize;
+            let buffer_len = u64::min(u64::from(CHUNK_SIZE), file_len - start) as usize;
             let mut data = vec![0; buffer_len];
             match file_read_at(&file, &mut data[..], start) {
                 Ok(len) => {
-                    data.truncate(len as usize);
-                    future::ok(data.into_boxed_slice())
+                    data.truncate(len);
+                    Ok(data.into_boxed_slice())
                 }
                 Err(e) => {
                     println!("Error reading file. {}", e);
-                    future::err(e)
+                    Err(e)
                 }
             }
         })
@@ -251,7 +254,7 @@ fn process_req(
                     // queue packet send task
                     current_thread::spawn(task_send(
                         &isend,
-                        &addr,
+                        addr,
                         OutMsg::Resp {
                             connid,
                             start,
@@ -261,8 +264,8 @@ fn process_req(
                 }
                 Err(_) => {
                     // error while reading file, terminate connection
-                    jobs.borrow_mut().remove(&(connid, addr.clone()));
-                    current_thread::spawn(task_end(&isend, &addr, connid));
+                    jobs.borrow_mut().remove(&(connid, addr));
+                    current_thread::spawn(task_end(&isend, addr, connid));
                 }
             }
             Ok(())
